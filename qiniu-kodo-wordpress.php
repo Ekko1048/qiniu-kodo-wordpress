@@ -43,6 +43,8 @@ function kodo_get_default_options()
         'upload_url_path' => '', // URL前缀
         'image_style' => '',
         'origin_protect' => 'false', // 原图保护
+        'video_style' => '',
+        'video_protect' => 'false', // 原视频保护
         'update_file_name' => 'false', // 是否重命名文件名
     ];
 }
@@ -192,7 +194,11 @@ function kodo_get_option($key)
 }
 
 $kodo_options = get_option('kodo_options', kodo_get_default_options());
-if (isset($kodo_options['origin_protect']) && esc_attr($kodo_options['origin_protect']) == 'true' && !empty(esc_attr($kodo_options['image_style']))) {
+$kodo_origin_protect = esc_attr($kodo_options['origin_protect'] ?? '') == 'true';
+$kodo_video_protect = esc_attr($kodo_options['video_protect'] ?? '') == 'true';
+$has_image_style = !empty(esc_attr($kodo_options['image_style'] ?? ''));
+$has_video_style = !empty(esc_attr($kodo_options['video_style'] ?? ''));
+if (($kodo_origin_protect && $has_image_style) || $kodo_video_protect || $has_video_style) {
     add_filter('wp_get_attachment_url', 'kodo_add_suffix_to_attachment_url', 10, 2);
     add_filter('wp_get_attachment_thumb_url', 'kodo_add_suffix_to_attachment_url', 10, 2);
     add_filter('wp_get_original_image_url', 'kodo_add_suffix_to_attachment_url', 10, 2);
@@ -207,8 +213,16 @@ if (isset($kodo_options['origin_protect']) && esc_attr($kodo_options['origin_pro
  */
 function kodo_add_suffix_to_attachment_url($url, $post_id)
 {
-    if (kodo_is_image_type($url)) {
-        $url .= kodo_get_image_style();
+    if (kodo_is_image_type($url) && kodo_is_origin_protect()) {
+        $style = kodo_get_image_style();
+        if (!empty($style)) {
+            $url .= $style;
+        }
+    } elseif (!empty($post_id)) {
+        $mime_type = get_post_mime_type($post_id);
+        if (!empty($mime_type) && strpos($mime_type, 'video/') === 0) {
+            $url = kodo_get_video_url($url);
+        }
     }
 
     return $url;
@@ -222,6 +236,14 @@ function kodo_add_suffix_to_attachment_url($url, $post_id)
 function kodo_add_suffix_to_attachment($response, $attachment)
 {
     if ($response['type'] != 'image') {
+        if ($response['type'] === 'video' && !empty($response['url'])) {
+            $response['url'] = kodo_get_video_url($response['url']);
+        }
+
+        return $response;
+    }
+
+    if (!kodo_is_origin_protect()) {
         return $response;
     }
 
@@ -250,11 +272,72 @@ function kodo_add_suffix_to_attachment($response, $attachment)
 function kodo_add_suffix_for_media_send_to_editor($data)
 {
     // https://github.com/WordPress/wordpress-develop/blob/43d2455dc68072fdd43c3c800cc8c32590f23cbe/src/wp-includes/media.php#L239
-    if (kodo_is_image_type($data['file'])) {
-        $data['file'] .= kodo_get_image_style();
+    if (kodo_is_image_type($data['file']) && kodo_is_origin_protect()) {
+        $style = kodo_get_image_style();
+        if (!empty($style)) {
+            $data['file'] .= $style;
+        }
     }
 
     return $data;
+}
+
+/**
+ * @param string $url
+ * @return string
+ */
+function kodo_get_video_url($url)
+{
+    $style = kodo_get_video_style();
+    if (!empty($style) && strpos($url, $style) === false) {
+        $url .= $style;
+    }
+
+    return kodo_is_video_protect() ? kodo_get_private_url($url) : $url;
+}
+
+/**
+ * @return bool
+ */
+function kodo_is_video_protect()
+{
+    $kodo_options = get_option('kodo_options', kodo_get_default_options());
+    return esc_attr($kodo_options['video_protect'] ?? '') == 'true';
+}
+
+/**
+ * @return bool
+ */
+function kodo_is_origin_protect()
+{
+    $kodo_options = get_option('kodo_options', kodo_get_default_options());
+    return esc_attr($kodo_options['origin_protect'] ?? '') == 'true';
+}
+
+/**
+ * @param string $url
+ * @return string
+ */
+function kodo_get_private_url($url)
+{
+    if (empty($url) || strpos($url, 'token=') !== false) {
+        return $url;
+    }
+
+    $auth = kodo_get_auth();
+    if (method_exists($auth, 'privateDownloadUrl')) {
+        return $auth->privateDownloadUrl($url, 3600);
+    }
+
+    if (method_exists($auth, 'sign')) {
+        $deadline = time() + 3600;
+        $separator = strpos($url, '?') === false ? '?' : '&';
+        $url_to_sign = "{$url}{$separator}e={$deadline}";
+        $token = $auth->sign($url_to_sign);
+        return "{$url_to_sign}&token={$token}";
+    }
+
+    return $url;
 }
 
 /**
@@ -267,13 +350,79 @@ function kodo_is_image_type($url)
 }
 
 /**
+ * @return array
+ */
+function kodo_get_image_mime_types()
+{
+    $mime_types = wp_get_mime_types();
+    $image_keys = [
+        'jpg|jpeg|jpe',
+        'gif',
+        'png',
+        'bmp',
+        'tiff|tif',
+        'webp',
+        'ico',
+    ];
+
+    $image_mime_types = [];
+    foreach ($image_keys as $key) {
+        if (isset($mime_types[$key])) {
+            $image_mime_types[] = $mime_types[$key];
+        }
+    }
+
+    return $image_mime_types;
+}
+
+/**
+ * @return array
+ */
+function kodo_get_allowed_mime_types()
+{
+    $mime_types = wp_get_mime_types();
+    $video_keys = [
+        'mp4|m4v',
+        'mov|qt',
+        'wmv',
+        'avi',
+        'mpg|mpeg|mpe',
+        'ogv',
+        'webm',
+        '3gp|3gpp',
+        '3g2|3gp2',
+        'flv',
+        'mkv',
+    ];
+
+    $allowed = kodo_get_image_mime_types();
+    foreach ($video_keys as $key) {
+        if (isset($mime_types[$key])) {
+            $allowed[] = $mime_types[$key];
+        }
+    }
+
+    return array_values(array_unique($allowed));
+}
+
+/**
  * @return string
  */
 function kodo_get_image_style()
 {
     $kodo_options = get_option('kodo_options', kodo_get_default_options());
 
-    return esc_attr($kodo_options['image_style']);
+    return esc_attr($kodo_options['image_style'] ?? '');
+}
+
+/**
+ * @return string
+ */
+function kodo_get_video_style()
+{
+    $kodo_options = get_option('kodo_options', kodo_get_default_options());
+
+    return esc_attr($kodo_options['video_style'] ?? '');
 }
 
 /**
@@ -284,20 +433,16 @@ function kodo_get_image_style()
  */
 function kodo_upload_attachments($metadata)
 {
-    $mime_types = wp_get_mime_types();
-    $image_mime_types = [
-        $mime_types['jpg|jpeg|jpe'],
-        $mime_types['gif'],
-        $mime_types['png'],
-        $mime_types['bmp'],
-        $mime_types['tiff|tif'],
-        $mime_types['webp'],
-        $mime_types['ico'],
-    ];
+    $allowed_mime_types = kodo_get_allowed_mime_types();
+    $image_mime_types = kodo_get_image_mime_types();
 
     // 例如mp4等格式 上传后根据配置选择是否删除 删除后媒体库会显示默认图片 点开内容是正常的
     // 图片在缩略图处理
-    if (!in_array($metadata['type'], $image_mime_types)) {
+    if (empty($metadata['type']) || !in_array($metadata['type'], $allowed_mime_types, true)) {
+        return $metadata;
+    }
+
+    if (!in_array($metadata['type'], $image_mime_types, true)) {
         //生成object在kodo中的存储路径
         if (kodo_get_option('upload_path') == '.') {
             $metadata['file'] = str_replace("./", '', $metadata['file']);
@@ -329,6 +474,12 @@ if (substr_count($_SERVER['REQUEST_URI'], '/update.php') <= 0) {
 function kodo_upload_thumbs($metadata)
 {
     if (empty($metadata['file'])) {
+        return $metadata;
+    }
+
+    $file_type = wp_check_filetype($metadata['file']);
+    $image_mime_types = kodo_get_image_mime_types();
+    if (empty($file_type['type']) || !in_array($file_type['type'], $image_mime_types, true)) {
         return $metadata;
     }
 
@@ -575,7 +726,8 @@ function kodo_wp_prepare_attachment_for_js($response)
     if (empty($response['filesizeInBytes']) || empty($response['filesizeHumanReadable'])) {
         $upload_url_path = kodo_get_option('upload_url_path');
         $upload_path = kodo_get_option('upload_path');
-        $object = str_replace($upload_url_path, $upload_path, $response['url']);
+        $response_url = strtok($response['url'], '?');
+        $object = str_replace($upload_url_path, $upload_path, $response_url);
         $meta = kodo_get_file_meta($object);
         if (!empty($meta['fsize'])) {
             $response['filesizeInBytes'] = $meta['fsize'];
@@ -677,9 +829,11 @@ function kodo_setting_page()
         $options['nothumb'] = isset($_POST['nothumb']) ? 'true' : 'false';
         $options['nolocalsaving'] = isset($_POST['nolocalsaving']) ? 'true' : 'false';
         $options['origin_protect'] = isset($_POST['origin_protect']) ? 'true' : 'false';
+        $options['video_protect'] = isset($_POST['video_protect']) ? 'true' : 'false';
         //仅用于插件卸载时比较使用
         $options['upload_url_path'] = isset($_POST['upload_url_path']) ? sanitize_text_field(stripslashes($_POST['upload_url_path'])) : '';
         $options['image_style'] = isset($_POST['image_style']) ? sanitize_text_field($_POST['image_style']) : '';
+        $options['video_style'] = isset($_POST['video_style']) ? sanitize_text_field($_POST['video_style']) : '';
         $options['update_file_name'] = isset($_POST['update_file_name']) ? sanitize_text_field($_POST['update_file_name']) : 'false';
     }
 
@@ -729,6 +883,7 @@ function kodo_setting_page()
     $kodo_nothumb = esc_attr($kodo_options['nothumb']) == 'true';
     $kodo_nolocalsaving = esc_attr($kodo_options['nolocalsaving']) == 'true';
     $kodo_origin_protect = esc_attr($kodo_options['origin_protect'] ?? '') == 'true';
+    $kodo_video_protect = esc_attr($kodo_options['video_protect'] ?? '') == 'true';
 
     $kodo_update_file_name = esc_attr($kodo_options['update_file_name']);
 
@@ -836,12 +991,33 @@ function kodo_setting_page()
                     </td>
                 </tr>
                 <tr>
+                    <th>
+                        <legend>视频样式</legend>
+                    </th>
+                    <td>
+                        <input type="text" name="video_style" value="<?php echo esc_attr($kodo_options['video_style'] ?? ''); ?>" size="50" placeholder="请输入视频样式，留空表示不处理"/>
+                        <p>填写时需要将<code>分隔符</code>和对应的<code>名称</code>或 <code>处理接口</code>进行拼接，例如：</p>
+                        <p><code>分隔符</code>为<code>!</code>(感叹号)，<code>名称</code>为<code>cover</code>，<code>处理接口</code>为 <code>vframe/jpg/offset/1</code></p>
+                        <p>则填写为 <code>!cover</code> 或 <code>?vframe/jpg/offset/1</code></p>
+                    </td>
+                </tr>
+                <tr>
                   <th>
                     <legend>原图保护</legend>
                   </th>
                   <td>
                     <input type="checkbox" name="origin_protect" <?php echo $kodo_origin_protect ? 'checked="checked"' : ''; ?> />
                     <p>在七牛云启用原图保护后勾选启用，需要先配置图片样式。</p>
+                    <p>注：此功能为实验性功能，如遇错误或不可用，请关闭后联系作者反馈。</p>
+                  </td>
+                </tr>
+                <tr>
+                  <th>
+                    <legend>原视频保护</legend>
+                  </th>
+                  <td>
+                    <input type="checkbox" name="video_protect" <?php echo $kodo_video_protect ? 'checked="checked"' : ''; ?> />
+                    <p>在七牛云启用视频保护或私有空间时勾选启用，可配合视频样式使用。</p>
                     <p>注：此功能为实验性功能，如遇错误或不可用，请关闭后联系作者反馈。</p>
                   </td>
                 </tr>
